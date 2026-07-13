@@ -1,0 +1,138 @@
+name: Check for Go Update
+
+# Daily check: if a newer Go patch exists on the same minor line as the
+# Dockerfile's base image, open a PR bumping it and immediately squash-merge
+# it with the release GitHub App token (the app is a bypass actor on the
+# master ruleset). The merge push then triggers build-release.yml.
+#
+# One-time setup, NOT enforceable from this file:
+#   * The release app must be a bypass actor on the master ruleset.
+#   * The app needs Contents: write and Pull requests: write on this repo.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Detect and log only; do not push, PR, or merge'
+        required: false
+        default: false
+        type: boolean
+
+defaults:
+  run:
+    shell: 'bash -Eeuo pipefail -x {0}'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check for Go update
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Detect current and latest Go version
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current="$(grep -oP '^FROM golang:\K[0-9]+\.[0-9]+\.[0-9]+' Dockerfile)"
+          minor="${current%.*}"
+          latest="$(gh api "repos/golang/go/git/matching-refs/tags/go${minor}." --paginate --jq '.[].ref' \
+            | sed 's|refs/tags/go||' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -1)"
+          [ -n "$latest" ]
+          {
+            echo "current=$current"
+            echo "latest=$latest"
+            echo "tag=1.19-go$latest"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$latest" = "$current" ]; then
+            echo "::notice::Go $current is the latest patch on the $minor line; nothing to do."
+            echo "update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip if release or open PR already exists
+        id: guards
+        if: steps.detect.outputs.update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.detect.outputs.tag }}
+          LATEST: ${{ steps.detect.outputs.latest }}
+        run: |
+          proceed=true
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG already exists; nothing to do."
+            proceed=false
+          elif [ -n "$(gh pr list --repo "$GITHUB_REPOSITORY" --head "go-bump-$LATEST" --state open --json number --jq '.[].number')" ]; then
+            echo "::notice::Open PR from go-bump-$LATEST already exists; leaving it to a human."
+            proceed=false
+          fi
+          echo "proceed=$proceed" >> "$GITHUB_OUTPUT"
+
+      - name: Dry run report
+        if: steps.detect.outputs.update == 'true' && inputs.dry_run
+        run: |
+          echo "::notice::Dry run: would bump Go ${{ steps.detect.outputs.current }} -> ${{ steps.detect.outputs.latest }}, release ${{ steps.detect.outputs.tag }} (guards proceed=${{ steps.guards.outputs.proceed }})."
+
+      - name: Create release GitHub App token
+        id: app-token
+        if: steps.detect.outputs.update == 'true' && steps.guards.outputs.proceed == 'true' && !inputs.dry_run
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Re-checkout with app token for pushing
+        if: steps.detect.outputs.update == 'true' && steps.guards.outputs.proceed == 'true' && !inputs.dry_run
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Create and merge bump PR
+        if: steps.detect.outputs.update == 'true' && steps.guards.outputs.proceed == 'true' && !inputs.dry_run
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          CURRENT: ${{ steps.detect.outputs.current }}
+          LATEST: ${{ steps.detect.outputs.latest }}
+          TAG: ${{ steps.detect.outputs.tag }}
+        run: |
+          user_id="$(gh api "users/${APP_SLUG}[bot]" --jq '.id')"
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+          git checkout -b "go-bump-${LATEST}"
+          sed -i "s|^FROM golang:${CURRENT}-|FROM golang:${LATEST}-|" Dockerfile
+          grep -q "^FROM golang:${LATEST}-" Dockerfile
+          git commit -am "Update Go base image to version ${LATEST}"
+          git push --force origin "go-bump-${LATEST}"
+
+          pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" \
+            --base master --head "go-bump-${LATEST}" \
+            --title "Update Go base image to version ${LATEST}" \
+            --body "Automated Go patch bump ${CURRENT} -> ${LATEST}.
+
+          Merging this triggers build-release.yml, which will publish release \`${TAG}\` and open GOSU_VERSION bump PRs in questdb and questdb-enterprise.
+
+          Opened by the check-go-update workflow.")"
+
+          # Mergeability can lag right after PR creation; retry a few times.
+          for i in 1 2 3 4 5; do
+            if gh pr merge --squash --delete-branch "$pr_url"; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Failed to merge $pr_url after retries."
+          exit 1
