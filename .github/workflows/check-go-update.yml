@@ -24,6 +24,10 @@ defaults:
   run:
     shell: 'bash -Eeuo pipefail -x {0}'
 
+concurrency:
+  group: check-go-update
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -34,6 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: master
           persist-credentials: false
 
       - name: Detect current and latest Go version
@@ -54,8 +59,12 @@ jobs:
             echo "tag=1.19-go$latest"
           } >> "$GITHUB_OUTPUT"
           if [ "$latest" = "$current" ]; then
-            echo "::notice::Go $current is the latest patch on the $minor line; nothing to do."
             echo "update=false" >> "$GITHUB_OUTPUT"
+            if ! gh release view "1.19-go$current" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "::error::Dockerfile is at Go $current but release 1.19-go$current does not exist -- build-release likely failed. Re-run it via workflow_dispatch with tag=1.19-go$current."
+              exit 1
+            fi
+            echo "::notice::Go $current is the latest patch on the $minor line and release 1.19-go$current exists; nothing to do."
           else
             echo "update=true" >> "$GITHUB_OUTPUT"
           fi
@@ -97,6 +106,7 @@ jobs:
         if: steps.detect.outputs.update == 'true' && steps.guards.outputs.proceed == 'true' && !inputs.dry_run
         uses: actions/checkout@v4
         with:
+          ref: master
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Create and merge bump PR
@@ -130,6 +140,10 @@ jobs:
           # Mergeability can lag right after PR creation; retry a few times.
           for i in 1 2 3 4 5; do
             if gh pr merge --squash --delete-branch "$pr_url"; then
+              exit 0
+            fi
+            if [ "$(gh pr view "$pr_url" --json state --jq '.state')" = "MERGED" ]; then
+              echo "::notice::$pr_url was already merged."
               exit 0
             fi
             sleep 10
