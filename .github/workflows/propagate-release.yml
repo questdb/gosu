@@ -1,0 +1,117 @@
+name: Propagate Release
+
+# When a gosu release is published, open PRs bumping ENV GOSU_VERSION in the
+# downstream QuestDB repos. Fires on app-token-created releases (build-release)
+# and manually published ones alike.
+# One-time setup, NOT enforceable from this file:
+#   * The release app must be installed on questdb/questdb and
+#     questdb/questdb-enterprise with Contents: write + Pull requests: write.
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to propagate (e.g. 1.19-go1.25.12)'
+        required: true
+        type: string
+
+defaults:
+  run:
+    shell: 'bash -Eeuo pipefail -x {0}'
+
+permissions:
+  contents: read
+
+jobs:
+  propagate:
+    name: Bump gosu in questdb/${{ matrix.repo }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - repo: questdb
+            dockerfile: core/Dockerfile
+            base: master
+          - repo: questdb-enterprise
+            dockerfile: Dockerfile
+            base: main
+    steps:
+      - name: Validate tag
+        id: tag
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          if [[ "$TAG" =~ ^1\.[0-9]+-go[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            proceed=true
+          else
+            echo "::notice::Tag '$TAG' is not a gosu build tag; skipping propagation."
+            proceed=false
+          fi
+          {
+            echo "tag=$TAG"
+            echo "proceed=$proceed"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub App token for questdb/${{ matrix.repo }}
+        id: app-token
+        if: steps.tag.outputs.proceed == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
+          owner: questdb
+          repositories: ${{ matrix.repo }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout questdb/${{ matrix.repo }}
+        if: steps.tag.outputs.proceed == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: questdb/${{ matrix.repo }}
+          ref: ${{ matrix.base }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Create bump PR
+        if: steps.tag.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          REPO: questdb/${{ matrix.repo }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          BASE: ${{ matrix.base }}
+        run: |
+          current="$(grep -oP '^ENV GOSU_VERSION=\K.*' "$DOCKERFILE")"
+          if [ "$current" = "$TAG" ]; then
+            echo "::notice::$REPO is already at gosu $TAG; nothing to do."
+            exit 0
+          fi
+          if [ -n "$(gh pr list --repo "$REPO" --head "bump-gosu-$TAG" --state open --json number --jq '.[].number')" ]; then
+            echo "::notice::Open PR from bump-gosu-$TAG already exists in $REPO; nothing to do."
+            exit 0
+          fi
+
+          user_id="$(gh api "users/${APP_SLUG}[bot]" --jq '.id')"
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+          git checkout -b "bump-gosu-$TAG"
+          sed -i "s|^ENV GOSU_VERSION=.*|ENV GOSU_VERSION=$TAG|" "$DOCKERFILE"
+          grep -qx "ENV GOSU_VERSION=$TAG" "$DOCKERFILE"
+          git commit -am "chore(build): bump gosu to $TAG"
+          git push --force origin "bump-gosu-$TAG"
+
+          gh pr create --repo "$REPO" \
+            --base "$BASE" --head "bump-gosu-$TAG" \
+            --title "chore(build): bump gosu to $TAG" \
+            --body "## Summary
+          - Bump gosu to \`$TAG\` (rebuilt with a newer Go patch for stdlib CVE fixes)
+
+          Release: https://github.com/questdb/gosu/releases/tag/$TAG
+
+          Opened automatically by the propagate-release workflow in questdb/gosu."
