@@ -137,9 +137,14 @@ jobs:
 
           Opened by the check-go-update workflow.")"
 
-          # Mergeability can lag right after PR creation; retry a few times.
+          # gh pr merge pre-flights mergeability and refuses blocked PRs even
+          # when the caller's ruleset bypass would resolve the block
+          # (cli/cli#13388). The REST merge endpoint engages bypass correctly,
+          # so call it directly. Retry: mergeability can lag after PR creation.
+          pr_number="${pr_url##*/}"
           for i in 1 2 3 4 5; do
-            if gh pr merge --squash --delete-branch "$pr_url"; then
+            if gh api -X PUT "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}/merge" -f merge_method=squash; then
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/go-bump-${LATEST}" || true
               exit 0
             fi
             if [ "$(gh pr view "$pr_url" --json state --jq '.state')" = "MERGED" ]; then
