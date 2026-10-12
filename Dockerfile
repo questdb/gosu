@@ -1,4 +1,4 @@
-FROM golang:1.25.14-trixie
+FROM golang:1.27.2-trixie
 
 RUN set -eux; \
 	apt-get install --update -y --no-install-recommends \
