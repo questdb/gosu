@@ -32,7 +32,7 @@ jobs:
       - run: docker pull golang
 
       - name: hack in qemu-binfmt
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends binfmt-support qemu-user-static
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends binfmt-support qemu-user-binfmt
         if: matrix.go == 'release'
 
       - name: "${{ matrix.go == 'latest' && 'update and build' || 'build' }}"
